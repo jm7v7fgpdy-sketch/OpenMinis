@@ -146,6 +146,8 @@ struct MinisApp: App {
         #if DEBUG
         try? debugServer.start(port: 8321)
         #endif
+        // Fail-closed /gateway/prompt listener (kill-switch default OFF).
+        GatewayPromptIngressServer.shared.start()
         // Install the NSTextContainer setSize: reentrancy guard before any
         // UITextView gets created. Breaks the iOS 26 TextKit1 fillLayoutHole
         // storm that has caused 0x8BADF00D scene-update watchdog kills on
@@ -520,6 +522,7 @@ struct MinisApp: App {
                 #if DEBUG
                 debugServer.restartIfDead(port: 8321)
                 #endif
+                GatewayPromptIngressServer.shared.restartIfDead()
 
                 try? await UNUserNotificationCenter.current().setBadgeCount(0)
                 BackgroundInterruptionTracker.shared.checkOnForeground()
