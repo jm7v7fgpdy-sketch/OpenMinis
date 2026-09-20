@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 #
-# Cloud Agent install script for OpenMinis (Android target).
+# Android build bootstrap for the OpenMinis Cursor Cloud Agent environment.
 #
-# The base image/snapshot already carries the stable, slow toolchain:
-# JDK 17, the Android SDK (platform 36/35, build-tools, platform-tools,
-# NDK r28, CMake 3.22.1), a recent Go toolchain, gomobile/gobind, gawk and
-# ninja. This script performs the repository-dependent bootstrap that must run
+# This mirrors the `install` step of the saved Cloud Agent environment (that
+# environment stores the same logic inline and boots from a snapshot base that
+# already carries the stable, slow toolchain). Keeping it here as a committed,
+# readable script means the exact bootstrap is versioned with the code and can
+# also be run by hand on a machine that already has the toolchain.
+#
+# The base image/snapshot provides: JDK 17, the Android SDK (platform 36/35,
+# build-tools, platform-tools, NDK r27+r28, CMake 3.22.1), a recent Go
+# toolchain, gomobile/gobind, gawk and ninja, plus /etc/profile.d/android-env.sh
+# which exports JAVA_HOME / ANDROID_* / PATH.
+#
+# This script performs only the repository-dependent bootstrap that must run
 # against the checked-out source: init the proot submodule, materialize the
 # build-time customization file, build the native sandbox (proot + Alpine
 # rootfs), build the rclone AAR, and stage them where Gradle expects them.
@@ -16,6 +24,11 @@
 # iOS is intentionally out of scope here: it requires macOS + Xcode and cannot
 # be built on this Linux VM. See BUILDING.md for the iOS instructions.
 set -euo pipefail
+
+# Pick up the toolchain env if the base image provides it (no-op otherwise;
+# the explicit exports below are the source of truth for this script).
+# shellcheck disable=SC1091
+[ -f /etc/profile.d/android-env.sh ] && source /etc/profile.d/android-env.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
