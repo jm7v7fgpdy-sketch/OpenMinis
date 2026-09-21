@@ -16,9 +16,13 @@ from xiaoxin_device_status import (
     FRESH_MAX_AGE_SECONDS,
     HR_RECENT_MAX_SECONDS,
     REASON_CODES,
+    SCHEMA_TYPE,
+    SLACK_SUMMARY_PREFIX,
     build_report,
     canonical_dumps,
+    format_instinct_slack,
     integrity_sha256,
+    map_mac_snapshot,
 )
 
 
@@ -285,7 +289,7 @@ class SchemaMappingTests(unittest.TestCase):
             "status": "fresh",
             "observed_at": "2026-09-21T17:05:40+08:00",
             "age_seconds": 20,
-            "hostname": "redacted-host",
+            "hostname": "AndersendeMini",
             "uptime_seconds": 86400,
             "load_1m": 0.42,
             "disk_free_pct": 37,
@@ -298,9 +302,80 @@ class SchemaMappingTests(unittest.TestCase):
             mac=mac,
             now=NOW,
         )
-        self.assertEqual(report["mac"]["hostname"], "redacted-host")
+        self.assertEqual(report["mac"]["hostname"], "AndersendeMini")
         self.assertEqual(report["mac"]["status"], "fresh")
         self.assertEqual(report["mac"]["load_1m"], 0.42)
+
+    def test_andersende_snapshot_maps_to_fresh_mac_and_is_hashed(self):
+        snapshot = {
+            "source": "andersende-mini",
+            "hostname": "AndersendeMini",
+            "timestamp": "2026-09-21T17:05:40+08:00",
+            "uptime_seconds": 86400,
+            "loadavg": [0.42, 0.50, 0.55],
+            "disk_free_pct": 37,
+        }
+        mac = map_mac_snapshot(snapshot, NOW)
+        self.assertEqual(mac["status"], "fresh")
+        self.assertEqual(mac["hostname"], "AndersendeMini")
+        self.assertEqual(mac["age_seconds"], 20)
+        self.assertEqual(mac["load_1m"], 0.42)
+        self.assertIsNone(mac["reason_code"])
+        self.assertNotIn("loadavg", mac)
+        self.assertNotIn("source", mac)
+
+        report = build_report(
+            phone=_phone_ok(),
+            steps=_steps_ok(),
+            heart_rate=_hr_ok(),
+            mac=snapshot,
+            now=NOW,
+            report_id="00000000-0000-4000-8000-000000000001",
+        )
+        self.assertEqual(report["mac"]["hostname"], "AndersendeMini")
+        without_mac = build_report(
+            phone=_phone_ok(),
+            steps=_steps_ok(),
+            heart_rate=_hr_ok(),
+            now=NOW,
+            report_id="00000000-0000-4000-8000-000000000001",
+        )
+        self.assertNotEqual(
+            report["integrity"]["canonical_sha256"],
+            without_mac["integrity"]["canonical_sha256"],
+        )
+        self.assertEqual(
+            report["integrity"]["canonical_sha256"], integrity_sha256(report)
+        )
+
+
+class InstinctSlackTests(unittest.TestCase):
+    def test_slack_summary_is_single_message_for_instinct(self):
+        report = build_report(
+            phone=_phone_ok(),
+            steps=_steps_ok(),
+            heart_rate=_hr_ok(),
+            mac={
+                "hostname": "AndersendeMini",
+                "observed_at": "2026-09-21T17:05:40+08:00",
+                "uptime_seconds": 86400,
+                "load_1m": 0.42,
+                "disk_free_pct": 37,
+            },
+            now=NOW,
+            report_id="00000000-0000-4000-8000-000000000001",
+        )
+        text = format_instinct_slack(report)
+        self.assertTrue(text.startswith(SLACK_SUMMARY_PREFIX))
+        self.assertEqual(SLACK_SUMMARY_PREFIX, "@Instinct [XIAOXIN_DEVICE_STATUS_V1]")
+        self.assertIn(SCHEMA_TYPE, text)
+        self.assertIn("AndersendeMini", text)
+        self.assertIn("iPhone17,1", text)
+        self.assertIn("8432", text)
+        self.assertNotIn("REDACTED_DEVICE_NAME", text)
+        self.assertNotIn("webhook", text.lower())
+        self.assertNotIn("https://hooks.slack.com", text)
+        self.assertEqual(text.count("@Instinct"), 1)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Map existing Open Minis apple-device / apple-healthkit JSON into XIAOXIN_DEVICE_STATUS_V1.
+"""Assemble XIAOXIN_DEVICE_STATUS_V1 for 知芯 (Instinct) to verify.
 
-Read-only. Does not call HealthKit write APIs, does not control the phone, and
-does not start a scheduler. Intended for a single awake Open Minis turn:
+Audience is 知芯, not 小芯. Collection still uses Open Minis
+`apple-device` / `apple-healthkit` because that is the read path for
+phone+health. 领芯 merges the AndersendeMini mac snapshot, then this
+helper prints one Slack summary:
 
-  apple-device info --compact > /tmp/xx-phone.json
-  apple-healthkit steps --today --compact > /tmp/xx-steps.json
-  apple-healthkit heart-rate --days 1 --limit 1 --compact > /tmp/xx-hr.json
-  python3 xiaoxin_device_status.py --phone /tmp/xx-phone.json \\
-      --steps /tmp/xx-steps.json --hr /tmp/xx-hr.json
+  @Instinct [XIAOXIN_DEVICE_STATUS_V1]
 
-Mac fields are filled by 领芯 outside this repo; pass --mac or leave the stub.
+Read-only. No HealthKit writes, phone control, scheduler, or Slack routing.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ HR_RECENT_MAX_SECONDS = 15 * 60
 PRODUCER = "xiaoxin+lingxin"
 SCHEMA_TYPE = "XIAOXIN_DEVICE_STATUS_V1"
 SCHEMA_VERSION = 1
+SLACK_SUMMARY_PREFIX = "@Instinct [XIAOXIN_DEVICE_STATUS_V1]"
 
 REASON_CODES = frozenset(
     {
@@ -132,6 +131,82 @@ def _mac_stub() -> dict[str, Any]:
         "load_1m": 0,
         "disk_free_pct": 0,
         "reason_code": "NOT_CONFIGURED",
+    }
+
+
+def format_instinct_slack(report: Mapping[str, Any]) -> str:
+    """Single Slack message body for 知芯. Does not post; 领芯 uses existing routing."""
+    body = json.dumps(dict(report), ensure_ascii=False, indent=2, sort_keys=True)
+    return f"{SLACK_SUMMARY_PREFIX}\n```json\n{body}\n```\n"
+
+
+def _first_present(raw: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in raw and raw[key] is not None:
+            return raw[key]
+    return None
+
+
+def map_mac_snapshot(raw: Optional[Mapping[str, Any]], now: datetime) -> dict[str, Any]:
+    """Map 领芯 AndersendeMini snapshot (or a v1 mac block) into schema `mac`."""
+    if not raw or not isinstance(raw, Mapping):
+        return _mac_stub()
+
+    hostname = _first_present(raw, "hostname", "host", "computer_name")
+    if isinstance(hostname, str):
+        hostname = hostname.strip() or None
+    else:
+        hostname = str(hostname) if hostname is not None else None
+
+    observed_raw = _first_present(raw, "observed_at", "timestamp", "generated_at")
+    observed = _parse_dt(observed_raw if isinstance(observed_raw, str) else None)
+
+    uptime = _first_present(raw, "uptime_seconds", "uptime")
+    try:
+        uptime_seconds = int(uptime) if uptime is not None else 0
+    except (TypeError, ValueError):
+        uptime_seconds = 0
+
+    load = raw.get("load_1m")
+    if load is None:
+        loadavg = raw.get("loadavg") or raw.get("load_avg")
+        if isinstance(loadavg, (list, tuple)) and loadavg:
+            load = loadavg[0]
+    try:
+        load_1m = float(load) if load is not None else 0
+    except (TypeError, ValueError):
+        load_1m = 0
+
+    disk = _first_present(raw, "disk_free_pct", "disk_free_percent")
+    try:
+        disk_free_pct = int(disk) if disk is not None else 0
+    except (TypeError, ValueError):
+        try:
+            disk_free_pct = int(float(disk))
+        except (TypeError, ValueError):
+            disk_free_pct = 0
+
+    has_metrics = bool(hostname or uptime_seconds or load or disk)
+    if not has_metrics and observed is None:
+        return _mac_stub()
+
+    age = _age_seconds(observed, now) if observed is not None else 0
+    if observed is not None:
+        status = "fresh" if age <= FRESH_MAX_AGE_SECONDS else "stale"
+        reason: Optional[str] = None
+    else:
+        status = raw.get("status") if raw.get("status") in ("fresh", "stale", "unavailable") else "stale"
+        reason = None if status != "unavailable" else "QUERY_FAILED"
+
+    return {
+        "status": status,
+        "observed_at": _rfc3339(observed) if observed else None,
+        "age_seconds": age,
+        "hostname": hostname,
+        "uptime_seconds": uptime_seconds,
+        "load_1m": load_1m,
+        "disk_free_pct": disk_free_pct,
+        "reason_code": reason,
     }
 
 
@@ -281,19 +356,6 @@ def _health_block(
     return pack(status, reason)
 
 
-def _normalize_mac(mac: Optional[Mapping[str, Any]]) -> dict[str, Any]:
-    if not mac:
-        return _mac_stub()
-    stub = _mac_stub()
-    out = dict(stub)
-    for key in stub:
-        if key in mac:
-            out[key] = mac[key]
-    if out.get("reason_code") not in REASON_CODES and out.get("reason_code") is not None:
-        out["reason_code"] = "QUERY_FAILED"
-    return out
-
-
 def build_report(
     *,
     phone: Optional[Mapping[str, Any]] = None,
@@ -316,7 +378,7 @@ def build_report(
         "producer": PRODUCER,
         "phone": _phone_block(phone, now),
         "health": _health_block(steps, heart_rate, now),
-        "mac": _normalize_mac(mac),
+        "mac": map_mac_snapshot(mac, now),
     }
     report["integrity"] = {"canonical_sha256": integrity_sha256(report)}
     return report
@@ -331,13 +393,23 @@ def _load_json(path: Optional[str]) -> Optional[Any]:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Assemble XIAOXIN_DEVICE_STATUS_V1 from apple-device / apple-healthkit JSON."
+        description="Assemble XIAOXIN_DEVICE_STATUS_V1 for 知芯 (Instinct). "
+        "Does not post to Slack; prints one summary body."
     )
     parser.add_argument("--phone", help="JSON from `apple-device info --compact`")
     parser.add_argument("--steps", help="JSON from `apple-healthkit steps --today --compact`")
     parser.add_argument("--hr", help="JSON from `apple-healthkit heart-rate --days 1 --limit 1 --compact`")
-    parser.add_argument("--mac", help="Optional mac block JSON from 领芯 (not this repo)")
+    parser.add_argument(
+        "--mac",
+        help="AndersendeMini snapshot JSON from 领芯 (or a v1 mac block)",
+    )
     parser.add_argument("--report-id", help="Override report_id (tests); default uuid4")
+    parser.add_argument(
+        "--format",
+        choices=("slack", "json"),
+        default="slack",
+        help="slack = @Instinct [XIAOXIN_DEVICE_STATUS_V1] summary (default); json = envelope only",
+    )
     args = parser.parse_args(argv)
 
     phone = _load_json(args.phone)
@@ -347,8 +419,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     report = build_report(
         phone=phone, steps=steps, heart_rate=hr, mac=mac, report_id=args.report_id
     )
-    json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
-    sys.stdout.write("\n")
+    if args.format == "json":
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(format_instinct_slack(report))
     return 0
 
 

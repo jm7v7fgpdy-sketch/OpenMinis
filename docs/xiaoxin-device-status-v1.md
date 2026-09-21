@@ -1,108 +1,25 @@
-# XIAOXIN_DEVICE_STATUS_V1 — one-shot Open Minis bridge
+# XIAOXIN_DEVICE_STATUS_V1 — summary for 知芯 (Instinct)
 
-**Verdict:** existing Open Minis native offloads can fill `phone` + `health` without changing `apple-device`, `apple-healthkit`, phone-harness, Slack, or Known-Good.
+**Audience:** 知芯 (Instinct) must **see** phone + computer status in one place.
 
-A single awake iOS Open Minis turn runs three **read-only** guest commands, then this repo’s isolated mapper emits `XIAOXIN_DEVICE_STATUS_V1`. No scheduler, webhook, or second wake chain.
+This is **not** “小芯 reads for herself.” Open Minis is only the collection runtime because `apple-device` / `apple-healthkit` are the existing read-only path for phone + HealthKit. 领芯 already holds a **fresh AndersendeMini** mac snapshot. The mapper merges those sources, hashes the envelope, and emits **one Slack summary** 知芯 can verify:
 
-`PRODUCTION_CHANGED=false`. Guest CLI names: `apple-device` and `apple-healthkit` (older sandbox notes said `apple-health`; that string is **not** registered).
-
-Mac fields are filled by 领芯 outside this repo. The mapper inserts a `NOT_CONFIGURED` stub unless `--mac` is passed.
-
----
-
-## One-shot call path (iOS guest shell)
-
-Do **not** use `-q` / `--quiet`: envelope `timestamp` is `observed_at` / `queried_at`.
-
-Do **not** batch `steps` and `heart-rate` in one `apple-healthkit batch`. Batch shares one date range; `--today` is required for `steps_today` but would clip heart rate to calendar-today. Two commands:
-
-```sh
-apple-device info --compact > /tmp/xx-phone.json
-apple-healthkit steps --today --compact > /tmp/xx-steps.json
-apple-healthkit heart-rate --days 1 --limit 1 --compact > /tmp/xx-hr.json
-python3 tools/xiaoxin_device_status/xiaoxin_device_status.py \
-  --phone /tmp/xx-phone.json \
-  --steps /tmp/xx-steps.json \
-  --hr /tmp/xx-hr.json
+```
+@Instinct [XIAOXIN_DEVICE_STATUS_V1]
 ```
 
-Optional: `--mac /tmp/xx-mac.json` from 领芯.
-
-Offload permissions already in tree: `apple-device` is system/bypass; `apple-healthkit` is privacy (`Bypass` or session grant). OS HealthKit **read** for step count and heart rate must already be allowed. If Minis is not allowed, mapper sets `health.reason_code=PERMISSION_DENIED`. No new permission types.
-
-### Forbidden in this turn
-
-- `apple-healthkit log`, `log-blood-pressure`, `delete` (writes)
-- `apple-healthkit characteristic` (DOB / sex / blood type — PII, not in schema)
-- Copying `data.device.name` or `identifier_for_vendor` into the report
-- Copying HealthKit `source` strings (watch / app names)
+`PRODUCTION_CHANGED=false`. No Slack routing, webhook, scheduler, phone-harness, or Known-Good changes in this repo. 领芯 posts the printed text on the existing Slack path.
 
 ---
 
-## Field mapping
+## What 知芯 should receive
 
-### Phone ← `apple-device info` success envelope
+One message. Prefix exactly `@Instinct [XIAOXIN_DEVICE_STATUS_V1]`, then a JSON fence with the v1 envelope (`phone`, `health`, `mac`, `integrity`).
 
-| V1 field | Source | Notes |
-|---|---|---|
-| `phone.observed_at` | envelope `timestamp` | ISO-8601 with local offset (`noff_format_date`) |
-| `phone.age_seconds` | `now - observed_at` | `fresh` if `<= 300`, else `stale` |
-| `phone.model` | `data.machine` | utsname, e.g. `iPhone17,1`. **Not** `device.name` |
-| `phone.os_version` | `data.device.system_version` | e.g. `18.6.2`. Not `data.os_version` (includes build string) |
-| `phone.battery_pct` | `data.battery.level_percent` | integer 0–100 |
-| `phone.charging` | `data.battery.state` | `charging`/`full` → `yes`; `unplugged` → `no`; else `unknown` |
-| `phone.reason_code` | error envelope `error.code` | see table below; `null` on success |
+Synthetic example (no PII, no tokens):
 
-`apple-device battery` alone cannot fill `model` / `os_version`; use `info` (default).
-
-### Health ← `apple-healthkit steps` + `heart-rate`
-
-| V1 field | Source | Notes |
-|---|---|---|
-| `health.queried_at` | later of the two envelope `timestamp`s | `fresh` if query age `<= 300s` |
-| `health.steps_today.value` | `data.total` | daily cumulative for `--today` |
-| `health.steps_today.source_last_sample_at` | **always `null`** | statistics query has no last-sample time; do not fake it with midnight |
-| `health.latest_heart_rate_bpm.value` | first `data.samples[].bpm` | samples are newest-first |
-| `health.latest_heart_rate_bpm.observed_at` | first `data.samples[].date` | |
-| `health.reason_code` | see rules | `NO_RECENT_SAMPLE` if no sample **or** sample older than 15 minutes |
-
-Empty HR samples: `value=0`, `observed_at=null`, `reason_code=NO_RECENT_SAMPLE`. Query can still be `fresh`.
-
-### Mac ← 领芯 (stub only here)
-
-Default: `status=unavailable`, `reason_code=NOT_CONFIGURED`, zeros / nulls. 领芯 may replace the block (`hostname`, `uptime_seconds`, `load_1m`, `disk_free_pct`, `observed_at`, `age_seconds`) without adding PII beyond hostname.
-
----
-
-## Bridge error → `reason_code`
-
-Closed set: `PERMISSION_DENIED`, `SOURCE_UNREACHABLE`, `NO_RECENT_SAMPLE`, `QUERY_FAILED`, `TIMEOUT`, `NOT_CONFIGURED`.
-
-| Bridge `error.code` / condition | V1 `reason_code` |
-|---|---|
-| `authorization_denied`, `authorization_not_determined`; offload “Not Allowed” | `PERMISSION_DENIED` |
-| command missing, JSON absent, `not_available` (HealthKit unavailable) | `SOURCE_UNREACHABLE` |
-| `query_timeout` (15s HealthKit wait, including locked-store reads) | `TIMEOUT` |
-| `internal_error`, other failures | `QUERY_FAILED` |
-| HR missing or sample age `> 900s` | `NO_RECENT_SAMPLE` |
-| Mac not supplied | `NOT_CONFIGURED` |
-
-Any health `query_timeout` marks `health.status=unavailable` even if the other health command succeeded.
-
----
-
-## Envelope + integrity
-
-1. Build the object **without** `integrity`.
-2. Canonical JSON: UTF-8, no whitespace, object keys sorted (`json.dumps(..., ensure_ascii=False, separators=(',', ':'), sort_keys=True)` — RFC8785/JCS *concept* for this ASCII-key schema).
-3. `integrity.canonical_sha256` = lowercase SHA-256 hex of those bytes.
-
-`type` is `XIAOXIN_DEVICE_STATUS_V1`, `schema_version` is `1`, `producer` is `xiaoxin+lingxin`, `generated_at` is RFC3339 with numeric offset, `report_id` is UUID v4.
-
----
-
-## Example (synthetic, no PII)
-
+```
+@Instinct [XIAOXIN_DEVICE_STATUS_V1]
 ```json
 {
   "generated_at": "2026-09-21T17:06:00+08:00",
@@ -120,17 +37,17 @@ Any health `query_timeout` marks `health.status=unavailable` even if the other h
     }
   },
   "integrity": {
-    "canonical_sha256": "f34cca888958deaad337bd02fdb8adc87cb1e13a14172bb481de762e5e0858d6"
+    "canonical_sha256": "6312e367daa7024d5b366b02b15693e2fed22df8488325692220d1395fd904d6"
   },
   "mac": {
-    "age_seconds": 0,
-    "disk_free_pct": 0,
-    "hostname": null,
-    "load_1m": 0,
-    "observed_at": null,
-    "reason_code": "NOT_CONFIGURED",
-    "status": "unavailable",
-    "uptime_seconds": 0
+    "age_seconds": 20,
+    "disk_free_pct": 37,
+    "hostname": "AndersendeMini",
+    "load_1m": 0.42,
+    "observed_at": "2026-09-21T17:05:40+08:00",
+    "reason_code": null,
+    "status": "fresh",
+    "uptime_seconds": 86400
   },
   "phone": {
     "age_seconds": 10,
@@ -148,20 +65,99 @@ Any health `query_timeout` marks `health.status=unavailable` even if the other h
   "type": "XIAOXIN_DEVICE_STATUS_V1"
 }
 ```
+```
 
-Pretty-print above is for reading. The hash is over the compact sorted JSON **without** `integrity` (see `tools/xiaoxin_device_status/test_xiaoxin_device_status.py`).
+Hash is over compact sorted JSON **without** `integrity`, not over the Slack pretty-print.
 
 ---
 
-## Isolated adapter (this branch only)
+## How fields get into that JSON
+
+```
+Open Minis (one awake turn, read-only)
+  apple-device info          → phone
+  apple-healthkit steps      → health.steps_today
+  apple-healthkit heart-rate → health.latest_heart_rate_bpm
+领芯
+  AndersendeMini snapshot    → mac (already fresh)
+mapper (this branch)
+  merge + canonical SHA-256
+  print @Instinct [XIAOXIN_DEVICE_STATUS_V1] + JSON
+领芯
+  post that single string on the existing Slack path → 知芯 verifies
+```
+
+### Phone + health (Open Minis guest; do not use `-q`)
+
+Do **not** batch steps + heart-rate (shared date window). Guest name is `apple-healthkit`, not `apple-health`.
+
+```sh
+apple-device info --compact > /tmp/xx-phone.json
+apple-healthkit steps --today --compact > /tmp/xx-steps.json
+apple-healthkit heart-rate --days 1 --limit 1 --compact > /tmp/xx-hr.json
+```
+
+| V1 field | Source | Notes |
+|---|---|---|
+| `phone.observed_at` | envelope `timestamp` | `fresh` if age `<= 300s` |
+| `phone.model` | `data.machine` | e.g. `iPhone17,1`. **Not** `device.name` |
+| `phone.os_version` | `data.device.system_version` | e.g. `18.6.2` |
+| `phone.battery_pct` | `data.battery.level_percent` | int 0–100 |
+| `phone.charging` | `data.battery.state` | `charging`/`full` → `yes`; `unplugged` → `no`; else `unknown` |
+| `health.queried_at` | later of the two envelope timestamps | `fresh` if query age `<= 300s` |
+| `health.steps_today.value` | `data.total` | `--today` daily sum |
+| `health.steps_today.source_last_sample_at` | **always `null`** | statistics query has no last-sample time |
+| `health.latest_heart_rate_bpm.value` | first `data.samples[].bpm` | newest-first |
+| `health.latest_heart_rate_bpm.observed_at` | first `data.samples[].date` | `NO_RECENT_SAMPLE` if missing or `> 15min` |
+
+Forbidden in the Open Minis turn: `log`, `log-blood-pressure`, `delete`, `characteristic`; copying `device.name`, `identifier_for_vendor`, or HealthKit `source` strings.
+
+If HealthKit/offload denies: `health.reason_code=PERMISSION_DENIED`. Existing permission types only.
+
+### Mac (领芯 AndersendeMini snapshot — already fresh)
+
+Pass the snapshot as `--mac`. Mapper keeps only v1 keys (no extra snapshot fields in the envelope):
+
+| V1 `mac` | Snapshot aliases | Notes |
+|---|---|---|
+| `hostname` | `hostname` / `host` / `computer_name` | example: `AndersendeMini` |
+| `observed_at` | `observed_at` / `timestamp` / `generated_at` | RFC3339 with offset |
+| `age_seconds` | computed | `now - observed_at`; `fresh` if `<= 300s` |
+| `uptime_seconds` | `uptime_seconds` / `uptime` | int |
+| `load_1m` | `load_1m` or `loadavg[0]` | |
+| `disk_free_pct` | `disk_free_pct` / `disk_free_percent` | int |
+| `reason_code` | — | `null` when observed_at present |
+
+A v1 `mac` block is accepted as-is (same keys). If `--mac` is omitted, stub is `unavailable` / `NOT_CONFIGURED` (not the 知芯 path).
+
+### Integrity
+
+1. Object **without** `integrity`.
+2. Canonical JSON: `json.dumps(..., ensure_ascii=False, separators=(',', ':'), sort_keys=True)`.
+3. `integrity.canonical_sha256` = lowercase SHA-256 hex of those UTF-8 bytes.
+
+Mac is included **before** the hash. Changing AndersendeMini fields changes the digest.
+
+---
+
+## Mapper (isolated; 领芯 runs it)
+
+```sh
+python3 tools/xiaoxin_device_status/xiaoxin_device_status.py \
+  --phone /tmp/xx-phone.json \
+  --steps /tmp/xx-steps.json \
+  --hr /tmp/xx-hr.json \
+  --mac /tmp/xx-andersende.json
+# default --format slack  →  stdout is the @Instinct message
+```
+
+`--format json` prints the envelope only. This helper **does not post** to Slack.
 
 | File | Role |
 |---|---|
-| `tools/xiaoxin_device_status/xiaoxin_device_status.py` | Mapper + canonical SHA-256 |
-| `tools/xiaoxin_device_status/test_xiaoxin_device_status.py` | Schema / hash / reason-code tests |
-| `docs/xiaoxin-device-status-v1.md` | This playbook |
-
-Does not modify `src/ios/NativeOffloads/DeviceOffload.m` or `HealthKitOffload.m`.
+| `tools/xiaoxin_device_status/xiaoxin_device_status.py` | phone/health map, AndersendeMini mac map, hash, Slack text |
+| `tools/xiaoxin_device_status/test_xiaoxin_device_status.py` | schema / hash / Instinct prefix tests |
+| `docs/xiaoxin-device-status-v1.md` | this playbook |
 
 ```sh
 cd tools/xiaoxin_device_status && python3 -m unittest test_xiaoxin_device_status -v
@@ -169,6 +165,21 @@ cd tools/xiaoxin_device_status && python3 -m unittest test_xiaoxin_device_status
 
 ---
 
-## Out of scope (explicit)
+## Bridge errors → `reason_code`
 
-Scheduling, Slack bots, production merges, phone-harness / RemotePairing / CoreDevice / keyboard services, second wake chains, HealthKit writes, phone control.
+Closed set: `PERMISSION_DENIED`, `SOURCE_UNREACHABLE`, `NO_RECENT_SAMPLE`, `QUERY_FAILED`, `TIMEOUT`, `NOT_CONFIGURED`.
+
+| Condition | Code |
+|---|---|
+| `authorization_denied` / `authorization_not_determined` | `PERMISSION_DENIED` |
+| missing JSON / `not_available` | `SOURCE_UNREACHABLE` |
+| `query_timeout` | `TIMEOUT` |
+| other bridge failures | `QUERY_FAILED` |
+| HR missing or sample age `> 900s` | `NO_RECENT_SAMPLE` |
+| no mac snapshot | `NOT_CONFIGURED` |
+
+---
+
+## Out of scope
+
+Scheduling, new Slack bots or routing, production merges, phone-harness / RemotePairing / CoreDevice / keyboard services, second wake chains, HealthKit writes, phone control.
