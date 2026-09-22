@@ -1426,7 +1426,13 @@ final class BackgroundKeepAliveManager: NSObject, ObservableObject, CLLocationMa
     /// AppIntent-woken process. It:
     ///   1) records the (already-known) session id in the tracker so the
     ///      Combine publisher fires and `reevaluate` flips `isActive` to true,
-    ///   2) immediately re-evaluates silent audio so the AVAudioEngine
+    ///   2) forces the background flag when the AppIntent wake left us in
+    ///      `.inactive` / `.background` without ever firing didEnterBackground
+    ///      ([T-ios-shortcut-appintent-bg-flag]),
+    ///   3) synchronously activates keep-alive (do NOT wait for Combine's next
+    ///      main-queue turn — the immediate evaluateSilentAudio used to see
+    ///      `isActive=false` and permanently NOOP),
+    ///   4) immediately re-evaluates silent audio so the AVAudioEngine
     ///      spins up while the process still has wall-clock time.
     ///
     /// STRICTLY gated on `enhancedBackgroundEffective` (the user's
@@ -1440,7 +1446,16 @@ final class BackgroundKeepAliveManager: NSObject, ObservableObject, CLLocationMa
     @discardableResult
     func armEagerlyForShortcut(sessionId: String, caller: String) -> (armed: Bool, skipReason: String?) {
         let enhancedOn = enhancedBackgroundEnabled
-        let bgSpeakOn = backgroundSpeakEnabled
+        var bgSpeakOn = backgroundSpeakEnabled
+        // Enhanced master switch is supposed to pull Background Speak on
+        // (didSet), but older installs / minis-config flips can leave them
+        // desynced. Heal here so Shortcuts don't SKIP with a confusing
+        // bgSpeak=false while Enhanced is already on.
+        if enhancedOn && !bgSpeakOn {
+            backgroundSpeakEnabled = true
+            bgSpeakOn = true
+            logger.info("[ShortcutDiag] eagerKeepAlive healed backgroundSpeakEnabled=true (enhanced was on)")
+        }
         if !enhancedOn || !bgSpeakOn {
             let reason: String
             if !enhancedOn && !bgSpeakOn {
@@ -1453,9 +1468,47 @@ final class BackgroundKeepAliveManager: NSObject, ObservableObject, CLLocationMa
             logger.info("[ShortcutDiag] eagerKeepAlive caller=\(caller) decision=SKIPPED reason=\(reason)")
             return (false, reason)
         }
-        logger.info("[ShortcutDiag] eagerKeepAlive caller=\(caller) decision=STARTED session=\(sessionId.prefix(8))")
+
+        // [T-ios-shortcut-appintent-bg-flag] AppIntent wakes
+        // (`openAppWhenRun=false`) typically land in `.inactive` — so
+        // didEnterBackground never ran and appIsInBackground stays false,
+        // which makes evaluateSilentAudio permanently NOOP with
+        // reason=bg=false for the whole automation.
+        let appState = UIApplication.shared.applicationState
+        let forceBg = ShortcutEagerKeepAlivePolicy.shouldForceBackgroundFlag(
+            applicationStateRawValue: appState.rawValue,
+            currentlyMarkedBackground: appIsInBackground
+        )
+        if forceBg {
+            appIsInBackground = true
+            ISHKernel.shared.beginBackgroundCPUGovernor()
+            logger.info("[ShortcutDiag] eagerKeepAlive forced appIsInBackground=true appState=\(appState.rawValue)")
+        }
+
+        logger.info("[ShortcutDiag] eagerKeepAlive caller=\(caller) decision=STARTED session=\(sessionId.prefix(8)) appState=\(appState.rawValue) forcedBg=\(forceBg)")
         SessionActivityTracker.shared.setActive(sessionId, source: "\(caller).eager")
+
+        // [T-ios-shortcut-eager-sync-activate] Combine's reevaluate is
+        // `.receive(on: DispatchQueue.main)` — the *next* turn, not this one.
+        // Calling evaluateSilentAudio immediately after setActive used to see
+        // isActive=false and NOOP; silent audio never started for the run.
+        if !isActive {
+            logger.info("[BackgroundKeepAlive] Activating keep-alive synchronously for shortcut")
+            isActive = true
+            AgentLiveActivityManager.shared.startActivity(sessions: buildSessionSnapshots())
+            startUpdateTimer()
+            evaluateLocationUpdates()
+            evaluateBackgroundActivitySession()
+        }
+
         evaluateSilentAudio(caller: "\(caller).eager")
+        let canPlay = ShortcutEagerKeepAlivePolicy.canStartSilentAudio(
+            isActive: isActive,
+            backgroundSpeakEnabled: backgroundSpeakEnabled,
+            appIsInBackground: appIsInBackground,
+            silentAudioSuspendCount: silentAudioSuspendCount
+        )
+        logger.info("[ShortcutDiag] eagerKeepAlive post-eval silentAudio=\(self.silentAudioActive) canPlay=\(canPlay) isActive=\(self.isActive) bg=\(self.appIsInBackground)")
         return (true, nil)
     }
 

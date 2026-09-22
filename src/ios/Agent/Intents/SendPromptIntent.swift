@@ -151,6 +151,20 @@ struct SendPromptIntent: AppIntent {
         vm.inputText = prompt
         vm.send()
 
+        // [T-ios-shortcut-appintent-bg-flag] Without silent-audio keep-alive,
+        // returning from perform() immediately lets iOS re-suspend the
+        // AppIntent-woken process before the agent loop reaches the model.
+        // Hold the intent execution window until isProcessing flips (or a
+        // short budget elapses) so a cold start at least *starts* the run.
+        // Full completion still requires Enhanced Background + Background Speak.
+        if !eagerArmed && !waitForResult {
+            let budget = Date().addingTimeInterval(20)
+            for await processing in vm.$isProcessing.values {
+                if processing { break }
+                if Date() >= budget { break }
+            }
+        }
+
         let sid = vm.sessionId ?? "unknown"
 
         // Resolve actual model from session binding (matches what the agent loop uses)
