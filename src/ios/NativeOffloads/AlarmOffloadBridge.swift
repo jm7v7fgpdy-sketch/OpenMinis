@@ -227,7 +227,15 @@ nonisolated struct MinisAlarmMetadata: AlarmMetadata {}
                 for await alarms in manager.alarmUpdates {
                     // Drop persisted labels for alarms that no longer exist
                     // (fired / expired without going through our cancel path).
-                    pruneLabels(keeping: Set(alarms.map { $0.id.uuidString }))
+                    // [T-ios-alarm-empty-prune] Never wipe on an empty first
+                    // snapshot — after update / auth races AlarmKit can emit
+                    // [] before the real list arrives, which previously
+                    // DELETE'd every label and made morning alarms "vanish"
+                    // from the Minis UI even when the system alarm survived.
+                    let liveIds = Set(alarms.map { $0.id.uuidString })
+                    if !liveIds.isEmpty {
+                        pruneLabels(keeping: liveIds)
+                    }
                     for alarm in alarms {
                         var entry: [String: Any] = [
                             "id": alarm.id.uuidString,
@@ -453,14 +461,13 @@ private final class AlarmLabelStore {
         sqlite3_step(stmt)
     }
 
-    /// Delete every row whose id is not in [liveIds]. Empty set wipes the table.
+    /// Delete every row whose id is not in [liveIds].
+    /// [T-ios-alarm-empty-prune] An empty set is a no-op — callers must not
+    /// wipe the table on a transient empty AlarmKit snapshot.
     func prune(keeping liveIds: Set<String>) {
         lock.lock(); defer { lock.unlock() }
         guard let db else { return }
-        if liveIds.isEmpty {
-            exec("DELETE FROM alarm_labels")
-            return
-        }
+        if liveIds.isEmpty { return }
         // Parameterized NOT IN (?, ?, …) so ids are never string-interpolated.
         let placeholders = Array(repeating: "?", count: liveIds.count).joined(separator: ", ")
         let sql = "DELETE FROM alarm_labels WHERE alarm_id NOT IN (\(placeholders))"

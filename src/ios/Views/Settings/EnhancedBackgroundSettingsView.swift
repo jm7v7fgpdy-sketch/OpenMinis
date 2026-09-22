@@ -26,7 +26,7 @@ struct EnhancedBackgroundSettingsView: View {
                 Toggle("Enhanced Background Execution", isOn: $keepAlive.enhancedBackgroundEnabled)
                     .focusHighlight(shouldFocus("enhancedBackgroundExecution", current: keepAlive.enhancedBackgroundEnabled))
             } footer: {
-                Text("Keeps agent tasks running when the app is in the background. Shows progress via Live Activity on the Lock Screen and Dynamic Island. Also turns on Background Speak so text-to-speech narration keeps playing.")
+                Text("Keeps agent tasks running when the app is in the background — including overnight Shortcuts automations (Send Prompt / Morning Briefing). Shows progress via Live Activity on the Lock Screen and Dynamic Island. Also turns on Background Speak so silent-audio keep-alive (and TTS) can run while the app is backgrounded. Without this, a Time of Day automation wakes Minis briefly and iOS re-suspends before the model call starts.")
             }
 
             // [T-ipad16-liveactivity-restore-crash] Hidden on devices where

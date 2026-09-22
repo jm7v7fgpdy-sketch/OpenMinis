@@ -89,6 +89,16 @@ struct FollowUpSessionIntent: AppIntent {
         vm.send()
         logger.info("📎 FollowUp send() called, isProcessing=\(vm.isProcessing)")
 
+        // [T-ios-shortcut-appintent-bg-flag] See SendPromptIntent — hold the
+        // AppIntent window until the agent loop starts when keep-alive was skipped.
+        if !eagerResult.armed && !waitForResult {
+            let budget = Date().addingTimeInterval(20)
+            for await processing in vm.$isProcessing.values {
+                if processing { break }
+                if Date() >= budget { break }
+            }
+        }
+
         let sid = vm.sessionId ?? session.id
 
         // Resolve model name

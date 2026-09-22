@@ -149,6 +149,15 @@ struct RetryRunIntent: AppIntent {
         // Retry from that message (replacement attachments override the original ones)
         vm.retryFromMessage(targetMessage.id, replacementAttachments: replacementAttachments)
 
+        // [T-ios-shortcut-appintent-bg-flag] See SendPromptIntent.
+        if !eagerResult.armed && !waitForResult {
+            let budget = Date().addingTimeInterval(20)
+            for await processing in vm.$isProcessing.values {
+                if processing { break }
+                if Date() >= budget { break }
+            }
+        }
+
         let sid = vm.sessionId ?? session.id
 
         // Resolve model name

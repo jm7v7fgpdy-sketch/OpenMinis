@@ -148,6 +148,15 @@ struct QuickTaskIntent: AppIntent {
         vm.inputText = task.prompt
         vm.send()
 
+        // [T-ios-shortcut-appintent-bg-flag] See SendPromptIntent.
+        if !eagerResult.armed && !waitForResult {
+            let budget = Date().addingTimeInterval(20)
+            for await processing in vm.$isProcessing.values {
+                if processing { break }
+                if Date() >= budget { break }
+            }
+        }
+
         let sid = vm.sessionId ?? "unknown"
 
         // Resolve model name
