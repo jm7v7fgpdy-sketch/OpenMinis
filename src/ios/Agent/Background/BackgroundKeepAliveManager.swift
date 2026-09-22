@@ -1423,50 +1423,35 @@ final class BackgroundKeepAliveManager: NSObject, ObservableObject, CLLocationMa
     /// [T-shortcuts-eager-keepalive] Eager keep-alive hook for AppIntent entry
     /// points (Shortcuts automations). Call this synchronously at the top of an
     /// Intent's `perform()` BEFORE any `await` that would let iOS suspend the
-    /// AppIntent-woken process. It:
-    ///   1) records the (already-known) session id in the tracker so the
-    ///      Combine publisher fires and `reevaluate` flips `isActive` to true,
-    ///   2) forces the background flag when the AppIntent wake left us in
-    ///      `.inactive` / `.background` without ever firing didEnterBackground
-    ///      ([T-ios-shortcut-appintent-bg-flag]),
-    ///   3) synchronously activates keep-alive (do NOT wait for Combine's next
-    ///      main-queue turn — the immediate evaluateSilentAudio used to see
-    ///      `isActive=false` and permanently NOOP),
-    ///   4) immediately re-evaluates silent audio so the AVAudioEngine
-    ///      spins up while the process still has wall-clock time.
+    /// AppIntent-woken process.
     ///
-    /// STRICTLY gated on `enhancedBackgroundEffective` (the user's
-    /// enhancedBackgroundEnabled AND backgroundSpeakEnabled toggles both being
-    /// on). If the user hasn't opted into background keep-alive, this is a
-    /// no-op — we do NOT silently start background audio playback behind their
-    /// back. Returns `(armed, skipReason)` — a non-nil `skipReason` accompanies
-    /// `armed=false` so callers can log/persist WHY we skipped without having
-    /// to reconstruct the gating logic.
+    /// Running a Shortcuts automation is treated as opt-in to background
+    /// keep-alive: if Enhanced Background / Background Speak are still at the
+    /// factory-default OFF, they are turned ON and persisted for this device
+    /// ([T-ios-shortcut-auto-enable-keepalive]). Users can still flip them off
+    /// in Settings afterwards.
+    ///
+    /// Then:
+    ///   1) records the session id in the tracker,
+    ///   2) forces the background flag when the AppIntent wake left us in
+    ///      `.inactive` / `.background` ([T-ios-shortcut-appintent-bg-flag]),
+    ///   3) synchronously activates keep-alive (do NOT wait for Combine),
+    ///   4) starts silent audio while the process still has wall-clock time.
     @MainActor
     @discardableResult
     func armEagerlyForShortcut(sessionId: String, caller: String) -> (armed: Bool, skipReason: String?) {
-        let enhancedOn = enhancedBackgroundEnabled
-        var bgSpeakOn = backgroundSpeakEnabled
-        // Enhanced master switch is supposed to pull Background Speak on
-        // (didSet), but older installs / minis-config flips can leave them
-        // desynced. Heal here so Shortcuts don't SKIP with a confusing
-        // bgSpeak=false while Enhanced is already on.
-        if enhancedOn && !bgSpeakOn {
-            backgroundSpeakEnabled = true
-            bgSpeakOn = true
-            logger.info("[ShortcutDiag] eagerKeepAlive healed backgroundSpeakEnabled=true (enhanced was on)")
-        }
-        if !enhancedOn || !bgSpeakOn {
-            let reason: String
-            if !enhancedOn && !bgSpeakOn {
-                reason = "enhancedBackgroundEnabled=false;backgroundSpeakEnabled=false"
-            } else if !enhancedOn {
-                reason = "enhancedBackgroundEnabled=false"
-            } else {
-                reason = "backgroundSpeakEnabled=false"
+        // [T-ios-shortcut-auto-enable-keepalive] Factory defaults leave both
+        // toggles OFF, which permanently SKIPPED overnight automations even
+        // after the AppIntent bg-flag fix. Auto-enable + persist so the model
+        // can actually start.
+        if !enhancedBackgroundEnabled || !backgroundSpeakEnabled {
+            if !enhancedBackgroundEnabled {
+                enhancedBackgroundEnabled = true
             }
-            logger.info("[ShortcutDiag] eagerKeepAlive caller=\(caller) decision=SKIPPED reason=\(reason)")
-            return (false, reason)
+            if !backgroundSpeakEnabled {
+                backgroundSpeakEnabled = true
+            }
+            logger.info("[ShortcutDiag] eagerKeepAlive auto-enabled enhanced+speak for Shortcuts caller=\(caller)")
         }
 
         // [T-ios-shortcut-appintent-bg-flag] AppIntent wakes

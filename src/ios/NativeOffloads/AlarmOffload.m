@@ -44,7 +44,7 @@ static NSString *const HELP_TEXT =
      "SET OPTIONS:\n"
      "  --time <HH:MM|ISO>   Alarm time (required)\n"
      "  --label <text>       Alarm label\n"
-     "  --repeat <mode>      Repeat: none, daily, weekdays (default: none)\n"
+     "  --repeat <mode>      Repeat: none, daily, weekdays (default: daily for HH:MM, none for ISO)\n"
      "\n"
      "TIMER OPTIONS:\n"
      "  --duration <value>   Duration in seconds or shorthand (e.g. 5m, 1h) (required)\n"
@@ -207,7 +207,21 @@ static int cmd_set_alarmkit(int argc, char **argv, int stdout_fd,
         }
 
         NSString *label = noff_find_arg(argc, argv, "--label") ?: @"Alarm";
-        NSString *repeatMode = noff_find_arg(argc, argv, "--repeat") ?: @"none";
+        // [T-ios-alarm-hhmm-default-daily] HH:MM clock times are almost always
+        // morning routines. Defaulting to `none` made one-shot alarms vanish
+        // after the first fire (or after that calendar day), which users read
+        // as "the update deleted my 05:05 alarm". ISO one-shots keep `none`.
+        NSString *explicitRepeat = noff_find_arg(argc, argv, "--repeat");
+        BOOL isClockHHMM = NO;
+        {
+            NSRegularExpression *hmRegex =
+                [NSRegularExpression regularExpressionWithPattern:@"^(\\d{1,2}):(\\d{2})$"
+                                                         options:0 error:nil];
+            isClockHHMM = [hmRegex numberOfMatchesInString:timeStr
+                                                   options:0
+                                                     range:NSMakeRange(0, timeStr.length)] > 0;
+        }
+        NSString *repeatMode = explicitRepeat ?: (isClockHHMM ? @"daily" : @"none");
         NSString *alarmId = [[NSUUID UUID] UUIDString];
 
         __block NSDictionary *resultData = nil;
