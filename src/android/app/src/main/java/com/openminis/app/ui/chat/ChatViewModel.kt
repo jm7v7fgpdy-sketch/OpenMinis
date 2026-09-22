@@ -5653,9 +5653,12 @@ class ChatViewModel(
         streamJob = viewModelScope.launch(Dispatchers.IO) {
             AppLogger.info(TAG_STREAM, "$label streamJob ENTER sid=$activeSessionId")
             try {
+                // [T-android-swipe-keepalive-autonomous] Register keep-alive
+                // BEFORE the (possibly blocking) acquireSlot wait so a Recents
+                // swipe during the queue cannot stopSelf the FGS.
+                SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                 SessionConcurrencyManager.acquireSlot(activeSessionId)
                 AppLogger.debug(TAG_STREAM, "$label streamJob slot acquired")
-                SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                 val activeFallbackStrategy = run {
                     val groupId = _selectedGroupId.value
                     groupId?.let { providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy }
@@ -5699,6 +5702,7 @@ class ChatViewModel(
             } catch (e: CancellationException) {
                 AppLogger.info(TAG_STREAM, "$label streamJob CANCELLED waiting for slot")
                 Log.d(TAG, "Cancelled while waiting for concurrency slot")
+                SessionActivityTracker.setInactive(activeSessionId)
             }
             // [T-android-stale-streamjob-clears-isstreaming] Only the current
             // streamJob is allowed to flip _isStreaming false. An orphaned
@@ -6543,9 +6547,12 @@ class ChatViewModel(
                             SessionConcurrencyManager.diagSnapshot(),
                     )
                     // Acquire concurrency slot (suspends if at max)
+                    // [T-android-swipe-keepalive-autonomous] Keep-alive before
+                    // the slot wait so Recents swipe during queueing cannot
+                    // stopSelf the FGS.
+                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                     SessionConcurrencyManager.acquireSlot(activeSessionId)
                     AppLogger.debug(TAG_STREAM, "send streamJob slot acquired")
-                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
 
                     // Resolve the active group's fallback strategy
                     val activeFallbackStrategy = run {
@@ -6596,6 +6603,7 @@ class ChatViewModel(
                 } catch (e: CancellationException) {
                     AppLogger.info(TAG_STREAM, "send streamJob CANCELLED waiting for slot")
                     Log.d(TAG, "Cancelled while waiting for concurrency slot")
+                    SessionActivityTracker.setInactive(activeSessionId)
                 }
                 // [T-android-stale-streamjob-clears-isstreaming] guard — see
                 // `var streamJob` KDoc; identical pattern as runRerunStreamTail.
@@ -6884,9 +6892,10 @@ class ChatViewModel(
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(TAG_STREAM, "retryLast streamJob ENTER sid=$activeSessionId")
                 try {
+                    // [T-android-swipe-keepalive-autonomous] Keep-alive before slot wait.
+                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                     SessionConcurrencyManager.acquireSlot(activeSessionId)
                     AppLogger.debug(TAG_STREAM, "retryLast streamJob slot acquired")
-                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                     val activeFallbackStrategy = run {
                         val groupId = _selectedGroupId.value
                         groupId?.let { providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy }
@@ -6930,6 +6939,7 @@ class ChatViewModel(
                 } catch (e: CancellationException) {
                     AppLogger.info(TAG_STREAM, "retryLast streamJob CANCELLED waiting for slot")
                     Log.d(TAG, "Cancelled while waiting for concurrency slot")
+                    SessionActivityTracker.setInactive(activeSessionId)
                 }
                 // [T-android-stale-streamjob-clears-isstreaming] guard.
                 if (streamJob === coroutineContext[Job]) {
@@ -11430,9 +11440,10 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(TAG_STREAM, "resumeQueueAfterCancel streamJob ENTER sid=$activeSessionId")
                 try {
+                    // [T-android-swipe-keepalive-autonomous] Keep-alive before slot wait.
+                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                     SessionConcurrencyManager.acquireSlot(activeSessionId)
                     AppLogger.debug(TAG_STREAM, "resumeQueueAfterCancel streamJob slot acquired")
-                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
 
                     val activeFallbackStrategy = run {
                         val groupId = _selectedGroupId.value
@@ -11472,6 +11483,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     }
                 } catch (e: CancellationException) {
                     AppLogger.info(TAG_STREAM, "resumeQueueAfterCancel streamJob CANCELLED waiting for slot")
+                    SessionActivityTracker.setInactive(activeSessionId)
                 }
                 // [T-android-stale-streamjob-clears-isstreaming] guard.
                 if (streamJob === coroutineContext[Job]) {
@@ -11711,9 +11723,10 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(TAG_STREAM, "resume streamJob ENTER sid=$activeSessionId")
                 try {
+                    // [T-android-swipe-keepalive-autonomous] Keep-alive before slot wait.
+                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                     SessionConcurrencyManager.acquireSlot(activeSessionId)
                     AppLogger.debug(TAG_STREAM, "resume streamJob slot acquired")
-                    SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
                     val activeFallbackStrategy = run {
                         val groupId = _selectedGroupId.value
                         groupId?.let {
@@ -11756,6 +11769,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 } catch (e: CancellationException) {
                     AppLogger.info(TAG_STREAM, "resume streamJob CANCELLED waiting for slot")
                     Log.d(TAG, "Cancelled while waiting for concurrency slot (resume)")
+                    SessionActivityTracker.setInactive(activeSessionId)
                 }
                 // [T-android-stale-streamjob-clears-isstreaming] guard.
                 if (streamJob === coroutineContext[Job]) {
