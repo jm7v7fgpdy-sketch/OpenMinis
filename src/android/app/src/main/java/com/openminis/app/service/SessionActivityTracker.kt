@@ -42,6 +42,18 @@ object SessionActivityTracker {
     private val _presentSessions = MutableStateFlow<Set<String>>(emptySet())
     val presentSessions: StateFlow<Set<String>> = _presentSessions.asStateFlow()
 
+    /**
+     * [T-android-swipe-keepalive-autonomous] Sessions whose headless /
+     * scheduled run has been handed off but whose ChatViewModel streamJob
+     * has not yet reached [setActive] (that only happens after
+     * [SessionConcurrencyManager.acquireSlot]). A Recents swipe in that
+     * window used to see empty [activeSessions] and [stopSelf] the FGS,
+     * killing the autonomous message before it could start. Armed by
+     * [armSwipeKeepAlive] / cleared by [disarmSwipeKeepAlive].
+     */
+    private val _swipeKeepAliveSessions = MutableStateFlow<Set<String>>(emptySet())
+    val swipeKeepAliveSessions: StateFlow<Set<String>> = _swipeKeepAliveSessions.asStateFlow()
+
     private val _currentToolStatus = MutableStateFlow("Idle")
     val currentToolStatus: StateFlow<String> = _currentToolStatus.asStateFlow()
 
@@ -192,13 +204,62 @@ object SessionActivityTracker {
     private var appContext: Context? = null
 
     /**
-     * The service should run iff at least one session is streaming OR
-     * the user is currently present in at least one chat. Both inputs
-     * are independently mutated, so we always recompute from the live
-     * state flows rather than tracking a derived flag.
+     * The service should run iff at least one session is streaming, the
+     * user is currently present in at least one chat, OR a headless /
+     * scheduled run has armed swipe keep-alive for the pre-setActive gap.
+     * Inputs are independently mutated, so we always recompute from the
+     * live state flows rather than tracking a derived flag.
      */
     private fun shouldRunService(): Boolean =
-        _activeSessions.value.isNotEmpty() || _presentSessions.value.isNotEmpty()
+        _activeSessions.value.isNotEmpty() ||
+            _presentSessions.value.isNotEmpty() ||
+            _swipeKeepAliveSessions.value.isNotEmpty()
+
+    /**
+     * [T-android-swipe-keepalive-autonomous] Decision for
+     * [AgentForegroundService.onTaskRemoved]: survive the Recents swipe
+     * when a stream is active OR a headless/scheduled run is armed.
+     * Presence alone does not survive (T166).
+     */
+    fun shouldSurviveTaskRemoval(): Boolean =
+        TaskRemovalKeepAlivePolicy.shouldSurviveTaskRemoval(
+            activeSessionIds = _activeSessions.value,
+            armedSwipeKeepAliveIds = _swipeKeepAliveSessions.value,
+        )
+
+    /**
+     * [T-android-swipe-keepalive-autonomous] Arm keep-alive for a
+     * headless / scheduled session before its streamJob can call
+     * [setActive]. Idempotent. Starts the FGS if nothing else already
+     * holds it.
+     */
+    fun armSwipeKeepAlive(sessionId: String) {
+        if (sessionId in _swipeKeepAliveSessions.value) return
+        val wasIdle = !shouldRunService()
+        _swipeKeepAliveSessions.value = _swipeKeepAliveSessions.value + sessionId
+        Log.d(TAG, "Swipe keep-alive armed: $sessionId (armed total: ${_swipeKeepAliveSessions.value.size})")
+        if (wasIdle) {
+            startServiceIfNeeded()
+        } else {
+            updateService()
+        }
+    }
+
+    /**
+     * [T-android-swipe-keepalive-autonomous] Counterpart of
+     * [armSwipeKeepAlive]. Safe to call after [setActive] has taken over
+     * — active sessions alone keep the FGS running.
+     */
+    fun disarmSwipeKeepAlive(sessionId: String) {
+        if (sessionId !in _swipeKeepAliveSessions.value) return
+        _swipeKeepAliveSessions.value = _swipeKeepAliveSessions.value - sessionId
+        Log.d(TAG, "Swipe keep-alive disarmed: $sessionId (armed total: ${_swipeKeepAliveSessions.value.size})")
+        if (!shouldRunService()) {
+            stopService()
+        } else {
+            updateService()
+        }
+    }
 
     /**
      * T50: per-session stream-cancel callbacks. Each ChatViewModel
@@ -302,6 +363,13 @@ object SessionActivityTracker {
         // session joining an in-flight run must not restart the clock.
         val wasRunIdle = _activeSessions.value.isEmpty()
         _activeSessions.value = _activeSessions.value + sessionId
+        // [T-android-swipe-keepalive-autonomous] Hand off from any pre-stream
+        // arm for this session. Dropping the arm here (without stopService)
+        // keeps shouldRunService true via activeSessions.
+        if (sessionId in _swipeKeepAliveSessions.value) {
+            _swipeKeepAliveSessions.value = _swipeKeepAliveSessions.value - sessionId
+            Log.d(TAG, "Swipe keep-alive handed off to active: $sessionId")
+        }
         if (onStop != null) {
             synchronized(streamCancellers) { streamCancellers[sessionId] = onStop }
         }
@@ -577,8 +645,11 @@ object SessionActivityTracker {
      * double-counting a session that's both present and streaming.
      */
     private fun sessionCountForNotification(): Int =
-        if (_activeSessions.value.isNotEmpty()) _activeSessions.value.size
-        else _presentSessions.value.size
+        when {
+            _activeSessions.value.isNotEmpty() -> _activeSessions.value.size
+            _swipeKeepAliveSessions.value.isNotEmpty() -> _swipeKeepAliveSessions.value.size
+            else -> _presentSessions.value.size
+        }
 
     /**
      * Tool status fallback: when nothing is streaming, expose "In session"
@@ -611,6 +682,8 @@ object SessionActivityTracker {
                     if (activeCount == 1) "1 task running" else "$activeCount tasks running"
                 }
             }
+            _swipeKeepAliveSessions.value.isNotEmpty() ->
+                _currentToolStatus.value.takeIf { it.isNotBlank() && it != "Idle" } ?: "Starting…"
             _presentSessions.value.isNotEmpty() ->
                 ctx?.getString(com.openminis.app.R.string.notif_in_session) ?: "In session"
             else -> "Idle"

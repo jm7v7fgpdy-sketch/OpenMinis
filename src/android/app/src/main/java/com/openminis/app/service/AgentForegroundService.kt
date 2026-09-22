@@ -264,30 +264,42 @@ class AgentForegroundService : Service() {
         // here decides whether a swipe-away leaves a service behind that the
         // system will later revive with START_STICKY.
         val activeAtRemoval = SessionActivityTracker.activeSessions.value
+        val armedAtRemoval = SessionActivityTracker.swipeKeepAliveSessions.value
+        val survive = SessionActivityTracker.shouldSurviveTaskRemoval()
         println(
             "[T-STALL-DIAG] FGS onTaskRemoved pid=${android.os.Process.myPid()} " +
                 "activeSessions=${activeAtRemoval.size}[${activeAtRemoval.joinToString(",")}] " +
-                "decision=${if (activeAtRemoval.isEmpty()) "stopSelf" else "KEEP-ALIVE"} " +
+                "armedSwipe=${armedAtRemoval.size}[${armedAtRemoval.joinToString(",")}] " +
+                "decision=${if (survive) "KEEP-ALIVE" else "stopSelf"} " +
                 "slots=${SessionConcurrencyManager.diagSnapshot()}",
         )
         // T166: swiping from recents kills the Activity but the FG
-        // service should survive iff a stream is still running. Pure
-        // presence (user was reading a chat, then swiped away) is no
-        // longer a reason to keep alive — they explicitly dismissed
+        // service should survive iff a stream is still running OR a
+        // headless/scheduled run has armed swipe keep-alive for the
+        // pre-setActive gap ([T-android-swipe-keepalive-autonomous]).
+        // Pure presence (user was reading a chat, then swiped away) is
+        // no longer a reason to keep alive — they explicitly dismissed
         // the app, so clear presence here and re-evaluate.
         SessionActivityTracker.clearPresence()
-        if (SessionActivityTracker.activeSessions.value.isEmpty()) {
-            Log.d(TAG, "onTaskRemoved with no active sessions, stopping self")
+        if (!SessionActivityTracker.shouldSurviveTaskRemoval()) {
+            Log.d(TAG, "onTaskRemoved with no active/armed sessions, stopping self")
             stopSelf()
             return
         }
-        Log.d(TAG, "onTaskRemoved with ${SessionActivityTracker.activeSessions.value.size} active session(s) — keeping service alive")
+        Log.d(
+            TAG,
+            "onTaskRemoved with active=${SessionActivityTracker.activeSessions.value.size} " +
+                "armed=${SessionActivityTracker.swipeKeepAliveSessions.value.size} — keeping service alive",
+        )
         // Re-issue the foreground notification with current state so the
         // OS sees us as a "live" foreground service after the task tear-
         // down. Without this, OEM ROMs sometimes downgrade us to a plain
         // background service and reclaim within ~60 s.
+        val keepCount = SessionActivityTracker.activeSessions.value.size
+            .coerceAtLeast(SessionActivityTracker.swipeKeepAliveSessions.value.size)
+            .coerceAtLeast(1)
         val notification = buildNotification(
-            SessionActivityTracker.activeSessions.value.size,
+            keepCount,
             SessionActivityTracker.currentToolStatus.value,
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

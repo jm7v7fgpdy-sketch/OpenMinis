@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModelProvider
 import com.openminis.app.MinisApp
 import com.openminis.app.data.model.ThinkingLevel
+import com.openminis.app.service.SessionActivityTracker
 import com.openminis.app.ui.chat.ChatViewModel
 import com.openminis.app.ui.chat.ChatViewModelStore
 import com.openminis.app.ui.chat.InputAttachment
@@ -212,38 +213,59 @@ internal object HeadlessChatRunner {
                 timedOut = false,
             )
         }
-        for (att in attachments) vm.addAttachment(att)
-        vm.sendMessage(text)
-        if (!wait) return@withContext PromptResult(status = "Running", responseText = null, timedOut = false)
-
-        // Wait for isStreaming to be false (sendMessage flips it true synchronously
-        // before launching its coroutine; if it never flips true the message was
-        // dropped — return immediately as Completed-but-empty).
-        val started = vm.isStreaming.value
-        if (!started) {
-            // Either dropped (e.g. compacting in flight) or completed before we
-            // returned to the suspension point — fall through to drain.
-        }
-        val finished = withTimeoutOrNull(timeoutMs) {
-            // Skip the initial false (if we were called before sendMessage flipped true)
-            if (vm.isStreaming.value) {
-                // Wait for the next false transition.
-                vm.isStreaming.first { !it }
+        // [T-android-swipe-keepalive-autonomous] Cover the gap between
+        // "provider ready" and ChatViewModel.setActive (post-acquireSlot).
+        // ScheduledAgentRunner also arms; double-arm is idempotent.
+        // setActive hands off by clearing the arm for this sessionId.
+        SessionActivityTracker.armSwipeKeepAlive(sessionId)
+        try {
+            for (att in attachments) vm.addAttachment(att)
+            vm.sendMessage(text)
+            if (!wait) {
+                // Leave the arm in place until streamJob setActive hands off.
+                // If sendMessage never started streaming, clear so we don't leak.
+                if (!vm.isStreaming.value) {
+                    SessionActivityTracker.disarmSwipeKeepAlive(sessionId)
+                }
+                return@withContext PromptResult(status = "Running", responseText = null, timedOut = false)
             }
-            true
-        } ?: false
 
-        // Best-effort: read the last assistant text from the DB so we don't
-        // depend on the in-memory UI list (which may not have flushed yet).
-        val app = app(context)
-        val msgs = app.chatRepository.dao.loadMessages(sessionId)
-        val lastAssistant = msgs.lastOrNull { it.role == "assistant" }
-        val responseText = lastAssistant?.let { extractText(it.partsJson) }
-        PromptResult(
-            status = if (finished) "Completed" else "Timeout",
-            responseText = responseText,
-            timedOut = !finished,
-        )
+            // Wait for isStreaming to be false (sendMessage flips it true synchronously
+            // before launching its coroutine; if it never flips true the message was
+            // dropped — return immediately as Completed-but-empty).
+            val started = vm.isStreaming.value
+            if (!started) {
+                // Either dropped (e.g. compacting in flight) or completed before we
+                // returned to the suspension point — fall through to drain.
+            }
+            val finished = withTimeoutOrNull(timeoutMs) {
+                // Skip the initial false (if we were called before sendMessage flipped true)
+                if (vm.isStreaming.value) {
+                    // Wait for the next false transition.
+                    vm.isStreaming.first { !it }
+                }
+                true
+            } ?: false
+
+            // Best-effort: read the last assistant text from the DB so we don't
+            // depend on the in-memory UI list (which may not have flushed yet).
+            val app = app(context)
+            val msgs = app.chatRepository.dao.loadMessages(sessionId)
+            val lastAssistant = msgs.lastOrNull { it.role == "assistant" }
+            val responseText = lastAssistant?.let { extractText(it.partsJson) }
+            PromptResult(
+                status = if (finished) "Completed" else "Timeout",
+                responseText = responseText,
+                timedOut = !finished,
+            )
+        } finally {
+            // wait=true: stream finished (or never started) — drop any leftover arm.
+            // wait=false early-return skipped this finally's disarm via the branch
+            // above; setActive owns the handoff while the stream runs.
+            if (wait) {
+                SessionActivityTracker.disarmSwipeKeepAlive(sessionId)
+            }
+        }
     }
 
     suspend fun retry(
@@ -283,32 +305,42 @@ internal object HeadlessChatRunner {
                 retriedMessageId = targetMsgId,
             )
         }
-        vm.retryFromMessage(targetMsgId)
-        if (!wait) {
-            return@withContext PromptResult(
-                status = "Retrying",
-                responseText = null,
-                timedOut = false,
+        SessionActivityTracker.armSwipeKeepAlive(sessionId)
+        try {
+            vm.retryFromMessage(targetMsgId)
+            if (!wait) {
+                if (!vm.isStreaming.value) {
+                    SessionActivityTracker.disarmSwipeKeepAlive(sessionId)
+                }
+                return@withContext PromptResult(
+                    status = "Retrying",
+                    responseText = null,
+                    timedOut = false,
+                    deletedMessageCount = deletedCount,
+                    retriedMessageId = targetMsgId,
+                )
+            }
+            val finished = withTimeoutOrNull(timeoutMs) {
+                if (vm.isStreaming.value) {
+                    vm.isStreaming.first { !it }
+                }
+                true
+            } ?: false
+            val msgs = app.chatRepository.dao.loadMessages(sessionId)
+            val lastAssistant = msgs.lastOrNull { it.role == "assistant" }
+            val responseText = lastAssistant?.let { extractText(it.partsJson) }
+            PromptResult(
+                status = if (finished) "Completed" else "Timeout",
+                responseText = responseText,
+                timedOut = !finished,
                 deletedMessageCount = deletedCount,
                 retriedMessageId = targetMsgId,
             )
-        }
-        val finished = withTimeoutOrNull(timeoutMs) {
-            if (vm.isStreaming.value) {
-                vm.isStreaming.first { !it }
+        } finally {
+            if (wait) {
+                SessionActivityTracker.disarmSwipeKeepAlive(sessionId)
             }
-            true
-        } ?: false
-        val msgs = app.chatRepository.dao.loadMessages(sessionId)
-        val lastAssistant = msgs.lastOrNull { it.role == "assistant" }
-        val responseText = lastAssistant?.let { extractText(it.partsJson) }
-        PromptResult(
-            status = if (finished) "Completed" else "Timeout",
-            responseText = responseText,
-            timedOut = !finished,
-            deletedMessageCount = deletedCount,
-            retriedMessageId = targetMsgId,
-        )
+        }
     }
 
     /**

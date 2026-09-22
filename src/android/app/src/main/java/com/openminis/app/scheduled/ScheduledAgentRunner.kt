@@ -9,6 +9,7 @@ import com.openminis.app.MinisApp
 import com.openminis.app.debug.HeadlessChatRunner
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.service.AgentForegroundService
+import com.openminis.app.service.SessionActivityTracker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -110,6 +111,14 @@ object ScheduledAgentRunner {
             resolveSessionId(app, task)
         } ?: return null
 
+        // [T-android-swipe-keepalive-autonomous] Arm BEFORE dispatch. The FGS
+        // is already up, but onTaskRemoved only KEEP-ALIVEs when
+        // activeSessions OR swipeKeepAlive is non-empty. ChatViewModel
+        // setActive happens later (after acquireSlot inside streamJob), so
+        // without this arm a Recents swipe in the gap stopSelf's the FGS
+        // and kills the autonomous run.
+        SessionActivityTracker.armSwipeKeepAlive(sessionId)
+
         AppLogger.info(
             TAG,
             "running task=${task.id} label=\"${task.label}\" " +
@@ -117,12 +126,16 @@ object ScheduledAgentRunner {
         )
 
         if (waitForCompletion) {
-            val result = dispatch(app, task, sessionId, wait = true)
-            val preview = (result.responseText ?: "").take(200).ifBlank { "(no response)" }
-            val ok = result.status != "Error" && result.status != "Timeout"
-            ScheduledTaskManager(app).markFired(task.id, sessionId, preview, ok = ok)
-            postCompletionNotification(app, task, sessionId, preview)
-            return sessionId
+            try {
+                val result = dispatch(app, task, sessionId, wait = true)
+                val preview = (result.responseText ?: "").take(200).ifBlank { "(no response)" }
+                val ok = result.status != "Error" && result.status != "Timeout"
+                ScheduledTaskManager(app).markFired(task.id, sessionId, preview, ok = ok)
+                postCompletionNotification(app, task, sessionId, preview)
+                return sessionId
+            } finally {
+                SessionActivityTracker.disarmSwipeKeepAlive(sessionId)
+            }
         }
 
         // Fire-and-forget: the session is resolved and the FGS is up, so the
@@ -130,13 +143,18 @@ object ScheduledAgentRunner {
         // the app scope (wait=true so we still mark-fired + notify when it
         // finishes), and return the session id immediately so the UI can show
         // "task started" without blocking on the agent loop. Leaving the editor
-        // can't cancel it because bgScope outlives the screen.
+        // can't cancel it because bgScope outlives the screen. Keep-alive stays
+        // armed until dispatch finishes (stream setActive covers the middle).
         bgScope.launch {
-            val result = dispatch(app, task, sessionId, wait = true)
-            val preview = (result.responseText ?: "").take(200).ifBlank { "(no response)" }
-            val ok = result.status != "Error" && result.status != "Timeout"
-            ScheduledTaskManager(app).markFired(task.id, sessionId, preview, ok = ok)
-            postCompletionNotification(app, task, sessionId, preview)
+            try {
+                val result = dispatch(app, task, sessionId, wait = true)
+                val preview = (result.responseText ?: "").take(200).ifBlank { "(no response)" }
+                val ok = result.status != "Error" && result.status != "Timeout"
+                ScheduledTaskManager(app).markFired(task.id, sessionId, preview, ok = ok)
+                postCompletionNotification(app, task, sessionId, preview)
+            } finally {
+                SessionActivityTracker.disarmSwipeKeepAlive(sessionId)
+            }
         }
         return sessionId
     }
