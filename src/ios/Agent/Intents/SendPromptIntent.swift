@@ -156,7 +156,8 @@ struct SendPromptIntent: AppIntent {
         // AppIntent-woken process before the agent loop reaches the model.
         // Hold the intent execution window until isProcessing flips (or a
         // short budget elapses) so a cold start at least *starts* the run.
-        // Full completion still requires Enhanced Background + Background Speak.
+        // Full overnight completion relies on armEagerlyForShortcut (which
+        // now auto-enables Enhanced Background for Shortcuts).
         if !eagerArmed && !waitForResult {
             let budget = Date().addingTimeInterval(20)
             for await processing in vm.$isProcessing.values {
